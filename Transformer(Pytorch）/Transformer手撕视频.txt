@@ -1,0 +1,2 @@
+【19、Transformer模型Encoder原理精讲及其PyTorch逐行实现】https://www.bilibili.com/video/BV1cP4y1V7GF?vd_source=58cd116d4f3727402e47dc3abb530e6d
+07:29 三种mask 1）Encoder的mask 2）Decoder最下面的的mask 3）Decoder的中间层的mask 
