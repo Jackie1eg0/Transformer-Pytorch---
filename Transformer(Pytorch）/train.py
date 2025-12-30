@@ -37,10 +37,11 @@ model = Transformer(src_pad_idx=src_pad_idx,    # src_pad_idx & trg_pad_idx (填
 
                     enc_voc_size=enc_voc_size,  # 统计词典英语 德语的词表大小统计,此处有5912个
                                                 # (Encoder Vocabulary Size)源语言(英语)词表大小，有多少个单词
-                                                #  用于定义Embedding矩阵大小,enc_voc_size是10,000,d_model是512，那么 Encoder 入口处就会生成一个 [10000, 512] 的巨大矩阵，专门用来把整数索引变成向量。
+                                                #  用于定义Embedding矩阵大小,enc_voc_size是10,000,d_model是512，那么 Encoder 入口处就会生成一个 [10000, 512] 的巨大矩阵，专门用来把Token ID -> Vector。
                     dec_voc_size=dec_voc_size,  # (Decoder Vocabulary Size)目标语言（德文）词表大小，此处有7859个
                     
                     max_len=max_len,            # 最大序列长度256 token长度限制,如empowers这个vocalbulary可以被分为2个token em powers
+                                                #【Token 到底是什么？—— 揭秘大模型背后的“文字压缩术”】https://www.bilibili.com/video/BV1S5miBvEsu?vd_source=58cd116d4f3727402e47dc3abb530e6d
                     ffn_hidden=ffn_hidden,      # ffn_hidden = 2048 (前馈层隐藏维度)
                    
                     n_head=n_heads,             # Multihead 多头注意力机制 8 heads
@@ -62,10 +63,15 @@ optimizer = Adam(params=model.parameters(),
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                  factor=factor,
                                                  patience=patience)
+
+# 完全忽略Padding的交叉熵损失,在Transformer当中,无论是翻译任务还是文本生成任务,本质都是一个多分类问题
+# 输出是词表中每一个词成为下一个词的概率,若dec_val_size=7859那么本质是在做7859选1的多分类任务
+# 模型预测的下一个词的输出是一个长度为val_size的概率向量,而真实标签是一个One-Hot[0,0,1,0,...],在实际中只有真实词位置k为1,其他位置的yi为0,,只需看真实词对于的概率就行,让其最大化
 criterion = nn.CrossEntropyLoss(ignore_index=src_pad_idx)
 
 
 def train(model, iterator, optimizer, criterion, clip):
+
 # 参数model为Transformer对象(负责接受源语言索引序列 src 和目标语言索引序列 trg)并输出预测的概率分布。
 # iterator 训练数据的迭代器（通常是 PyTorch 的 DataLoader)
 # criterion 损失函数（代码中使用的是 CrossEntropyLoss）
@@ -76,21 +82,36 @@ def train(model, iterator, optimizer, criterion, clip):
         src, trg = batch    # src: 源语言句子张量,trg: 目标语言句子张量
                             # [batch_size, src_len]与[batch_size, trg_len]
         optimizer.zero_grad()
-        output = model(src, trg[:, :-1])        #*******???实际上没有经过Softmax层,就得到词表对应的概率
+        output = model(src, trg[:, :-1])  
         # 前向传播 假设target为[<sos>, A, B, <eos>] 模型输入(右下角outputs Shift Right) 为[<sos>, A, B]
-        # 模型预测输出(右上角 Outputs Probabilities)[Pred_A, Pred_B, Pred_eos]  模型的真实标签为[A, B, <eos>]
-
+        # 模型预测输出(右上角 Outputs Probabilities)，#output的形状是[512,trg_len,7859](batch_size在conf.py设置为512,trg_len是当前batch句子最长token大小,7859是dec_val_size) 
+        
+        print("经过Transformer的Output形状为:")
+        print(output.size()) 
+        #中间那个维度代表“当前这个 Batch 中最长句子的token长度,DataLoader采用动态填充机制,防止强制填充到max_len=256,计算冗余
         output_reshape = output.contiguous().view(-1, output.shape[-1])
-        # 原先output形状:[batch_size, trg_len - 1, output_dim] ->[(batch_size * (trg_len - 1)), output_dim]
+        print("经过reshape之后的Output形状为:")
+        print(output_reshape.size())
+        # 原先output形状:[batch_size, trg_len - 1, dec_val_size] ->[(batch_size * (trg_len - 1)), dec_val_size]
+        # batch_size一次处理多少个句子(512),trg_len-1在这个batch中最长的句子具有Token个数(去掉开头<sos>) dec_val_size德语词表长度,对每个单词作为下一个单词出现可能性概率打分
+        print("trg的形状为")
+        print(trg.size())
         trg = trg[:, 1:].contiguous().view(-1)
-        # 假设target为[<sos>, A, B, <eos>] ->[A, B, <eos>]从第二个开始
-        # 做交叉熵反向传播,将outputs预测的输出[Pred_A, Pred_B, Pred_eos]  和 真实的标签[A, B, <eos>]算损失函数
-
+        # trg应该是token ID序列(batch_size, trg_len)      [<sos> TokenID1 TokenID2 ... <pad>](<sos>与<pad>也会有对应的TokenID)
+        print("经过处理后的trg形状为")
+        print(trg.size())
+        # 处理后的trg去除<sos>并且变形为(batch*trg_len)一维的tensor
+        
         loss = criterion(output_reshape, trg)
+        # 做交叉熵反向传播,将outputs预测的输出与真实的标签trg, (batch_size,trg_len,dec_val_size)与(batch_size*trg_len , dec_val_size)做交叉熵
+        # 相当于从每一个Token视角他有TokenID 以及经过Transformer输出的dec_val_size预测可以做交叉熵
+        # 做交叉熵时候会先做 Softmax 把分数变成概率。
+        # 特别提醒：那个烦人的 Padding,后面有很多是填充符<pad>(ID=1)计算Loss时也会计算？
+        # ----->>初始化时的关键参数 criterion = nn.CrossEntropyLoss(ignore_index=src_pad_idx) # src_pad_idx 通常是 1
+        # ----->>虽然形式上是(18944, 7859)和(18944)做交叉熵，但有ignore_index,实际上只有那些非Padding的有效单词贡献了梯度和Loss,<pad>被完美地忽略了
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         optimizer.step()
-
         epoch_loss += loss.item()
         print('step :', round((i / len(iterator)) * 100, 2), '% , loss :', loss.item())
     return epoch_loss / len(iterator)
@@ -104,7 +125,7 @@ def evaluate(model, iterator, criterion):
         for i, batch in enumerate(iterator):
             src, trg = batch
             # target为[<sos>, A, B, <eos>] model的输入[<sos>, A, B]
-            # model期望的预测输出为[A, B, <eos>] 真实标签为[A, B, <eos>] output与真实标签做交叉熵
+            # model期望的预测输出为[A, B, <eos>] 真实标签trg_flat为[A, B, <eos>]
             output = model(src, trg[:, :-1])
             output_reshape = output.contiguous().view(-1, output.shape[-1])
             trg_flat = trg[:, 1:].contiguous().view(-1)
@@ -116,14 +137,14 @@ def evaluate(model, iterator, criterion):
             total_bleu = []
             for j in range(trg.shape[0]): # 遍历当前 Batch 中的每一句话
                 try:
-                    # 这是一个辅助函数（在 util.bleu 中定义）。它负责把数字索引序列（如 [4, 25, 11, 3]）转换回文本字符串（如 "i love you <eos>"）。
+                    # 这是一个辅助函数（在 util.bleu 中定义）。它负责TokenID如 [4, 25, 11, 3] 转换回文本字符串（如 "i love you <eos>"）。
                     # 通常它还会处理掉 <pad> 等特殊符号。
                     trg_words = idx_to_word(trg[j], loader.target)     
-                    # output[j] 的形状是 [seq_len, vocab_size]，max(dim=1) 会找到概率最大的那个词的概率值和索引 取 [1]，也就是取索引
-                    # 把索引转换为文本字符串
+                    # output为(batch_size,trg_len,dec_val_size),在第j个句子的每一个位置上找到概率最大的TokenID
                     output_words = output[j].max(dim=1)[1]              
                     output_words = idx_to_word(output_words, loader.target)
-                    # output_words = idx_to_word(output_words, loader.target.vocab)
+                    # 根据预测的TokenID得到文本串与真实的文本串做BLEU损失：
+                    # BLEU (Bilingual Evaluation Understudy) 分数的核心逻辑就是比较“预测出来的文本（Hypothesis）”和“真实标签文本（Reference）”的相似度。
                     bleu = get_bleu(hypotheses=output_words.split(), reference=trg_words.split())
                     total_bleu.append(bleu)
                 except Exception as e:
@@ -162,7 +183,6 @@ def run(total_epoch, best_loss):
         # 检查 result 文件夹是否存在，如果不存在则创建
         if not os.path.exists('result'):
             os.makedirs('result')
-        # 然后再执行你原来的代码
         f = open('result/train_loss.txt', 'w')
         f.write(str(train_losses))
         f.close()
